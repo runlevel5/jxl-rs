@@ -24,6 +24,9 @@ avx = ["sse42"]
 avx512 = ["avx"]
 neon = []
 simd128 = []
+# POWER8+ VSX on little-endian powerpc64. Requires a nightly compiler, so it is not part of
+# `all-simd`.
+vsx = []
 
 [lints]
 workspace = true
