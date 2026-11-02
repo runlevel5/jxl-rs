@@ -46,6 +46,7 @@ avx = ["jxl_simd/avx"]
 avx512 = ["jxl_simd/avx512"]
 neon = ["jxl_simd/neon"]
 simd128 = ["jxl_simd/simd128"]
+vsx = ["jxl_simd/vsx"]
 
 [lints]
 workspace = true
