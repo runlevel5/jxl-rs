@@ -4,6 +4,21 @@
 // license that can be found in the LICENSE file.
 
 #![allow(clippy::too_many_arguments)]
+// The PowerPC intrinsics are not stable yet, so the `vmx` feature requires a nightly compiler.
+#![cfg_attr(
+    all(feature = "vmx", target_arch = "powerpc64"),
+    feature(stdarch_powerpc)
+)]
+// `#[target_feature]` is only used for the instructions of ISA levels that are not part of the
+// compilation target.
+#![cfg_attr(
+    all(
+        feature = "vmx",
+        target_arch = "powerpc64",
+        not(target_feature = "power9-vector")
+    ),
+    feature(powerpc_target_feature)
+)]
 
 use std::fmt::Debug;
 use std::ops::{
@@ -20,12 +35,17 @@ mod aarch64;
 #[cfg(target_arch = "wasm32")]
 mod wasm32;
 
+#[cfg(target_arch = "powerpc64")]
+mod powerpc64;
+
 pub mod float16;
 pub mod scalar;
 
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 pub use aarch64::neon::NeonDescriptor;
 pub use float16::f16;
+#[cfg(all(target_arch = "powerpc64", feature = "vmx", target_feature = "altivec"))]
+pub use powerpc64::vsx::{Power8, Power9, Vmx, VsxDescriptor, VsxLevel};
 pub use scalar::ScalarDescriptor;
 #[cfg(all(target_arch = "wasm32", feature = "simd128"))]
 pub use wasm32::simd128::Simd128Descriptor;
@@ -612,7 +632,11 @@ pub trait SimdMask16:
 
 macro_rules! impl_f32_array_interface {
     () => {
-        type UnderlyingArray = [f32; Self::LEN];
+        crate::impl_f32_array_interface!(Self::LEN);
+    };
+    // Generic vector types cannot use `Self::LEN` in the array length, so they pass it explicitly.
+    ($len:expr) => {
+        type UnderlyingArray = [f32; $len];
 
         #[inline(always)]
         fn make_array_slice(slice: &[f32]) -> &[Self::UnderlyingArray] {
@@ -644,7 +668,11 @@ pub(crate) use impl_f32_array_interface;
 
 macro_rules! impl_i16_array_interface {
     () => {
-        type UnderlyingArray = [i16; Self::LEN];
+        crate::impl_i16_array_interface!(Self::LEN);
+    };
+    // Generic vector types cannot use `Self::LEN` in the array length, so they pass it explicitly.
+    ($len:expr) => {
+        type UnderlyingArray = [i16; $len];
 
         #[inline(always)]
         fn make_array_slice(slice: &[i16]) -> &[Self::UnderlyingArray] {
@@ -2120,7 +2148,7 @@ mod test {
             let mut res_andnot = vec![0i16; len];
             mask_andnot.if_then_else_i16(va, vb).store(&mut res_andnot);
             for i in 0..len {
-                let expected_mask = !(a[i] > b[i]) && (a[i] < 0);
+                let expected_mask = (a[i] <= b[i]) && (a[i] < 0);
                 assert_eq!(res_andnot[i], if expected_mask { a[i] } else { b[i] });
             }
 
