@@ -3,21 +3,23 @@
 // Use of this source code is governed by a BSD-style
 // license that can be found in the LICENSE file.
 
-//! VSX backend for POWER8 and newer, modelled on Highway's `ppc_vsx-inl.h`.
+//! AltiVec/VSX backend for PowerPC, modelled on Highway's `ppc_vsx-inl.h`.
 //!
-//! This module is only compiled when VSX and the POWER8 vector extensions are enabled at compile
-//! time (see `mod.rs`). Every vector type here holds a [`VsxDescriptor`], which is only
-//! constructed when the features of its [`VsxLevel`] are available. That is the safety argument
-//! for the intrinsic calls in the methods of these types. The free helper functions that use
-//! intrinsics are `unsafe` and require VSX to be available.
+//! This module is only compiled when AltiVec is enabled at compile time (see `mod.rs`), by the
+//! `vmx` feature; the `vsx` feature adds the POWER8 and POWER9 levels on top of it. Every
+//! vector type here holds a [`VsxDescriptor`], which is only constructed when the features of
+//! its [`VsxLevel`] are available. That is the safety argument for the intrinsic calls in the
+//! methods of these types. The free helper functions that use intrinsics are `unsafe` and
+//! require the features they document.
 //!
 //! The vector types are generic over a [`VsxLevel`]. All levels share the same implementation,
-//! but a few operations use instructions that are only available on a higher level. The level
-//! is chosen at compile time (e.g. with `-C target-cpu=power9`) rather than detected at runtime:
-//! LLVM's PowerPC backend only inlines a callee whose target features are exactly those of the
-//! caller, so a function that enabled POWER9 through `#[target_feature]` could not inline the
-//! stdarch intrinsics (which enable `altivec`), and every vector operation in it would become
-//! a function call.
+//! but a few operations use instructions that are only available on a higher level, and the
+//! AltiVec-only level [`Vmx`] (e.g. the PPC970) emulates the VSX and POWER8 instructions it
+//! lacks. The level is chosen at compile time (e.g. with `-C target-cpu=power9`) rather than
+//! detected at runtime: LLVM's PowerPC backend only inlines a callee whose target features are
+//! exactly those of the caller, so a function that enabled POWER9 through `#[target_feature]`
+//! could not inline the stdarch intrinsics (which enable `altivec`), and every vector operation
+//! in it would become a function call.
 //!
 //! Lanes are numbered in memory order on both little- and big-endian targets. The stdarch
 //! intrinsics used here are lane-order agnostic or already adjusted for the target endianness;
@@ -46,8 +48,11 @@ mod private {
     pub trait Sealed {}
 }
 
-/// A POWER ISA level supported by the VSX backend.
+/// A PowerPC vector ISA level supported by the backend.
 pub trait VsxLevel: private::Sealed + Copy + Debug + Send + Sync + 'static {
+    /// Whether VSX and the POWER8 (ISA 2.07) vector instructions are available.
+    const VSX: bool;
+
     /// Whether the POWER9 (ISA 3.0) vector instructions are available.
     const POWER9: bool;
 
@@ -55,18 +60,41 @@ pub trait VsxLevel: private::Sealed + Copy + Debug + Send + Sync + 'static {
     fn is_available() -> bool;
 }
 
-/// POWER8 (ISA 2.07), the powerpc64le baseline. It must be enabled at compile time.
+/// AltiVec only (e.g. the PPC970), big-endian.
+///
+/// Unaligned loads use the AltiVec `lvsl` idiom, which assumes big-endian lane order; the
+/// little-endian targets all have VSX anyway.
+#[derive(Clone, Copy, Debug)]
+pub struct Vmx;
+
+impl private::Sealed for Vmx {}
+
+impl VsxLevel for Vmx {
+    const VSX: bool = false;
+    const POWER9: bool = false;
+
+    fn is_available() -> bool {
+        // The module is only compiled when AltiVec is part of the compilation target.
+        BIG_ENDIAN
+    }
+}
+
+/// POWER8 (ISA 2.07), the powerpc64le baseline.
 #[derive(Clone, Copy, Debug)]
 pub struct Power8;
 
 impl private::Sealed for Power8 {}
 
 impl VsxLevel for Power8 {
+    const VSX: bool = true;
     const POWER9: bool = false;
 
     fn is_available() -> bool {
-        // The module is only compiled when the POWER8 features are part of the compilation target.
-        true
+        cfg!(all(
+            feature = "vsx",
+            target_feature = "vsx",
+            target_feature = "power8-vector"
+        ))
     }
 }
 
@@ -77,10 +105,11 @@ pub struct Power9;
 impl private::Sealed for Power9 {}
 
 impl VsxLevel for Power9 {
+    const VSX: bool = true;
     const POWER9: bool = true;
 
     fn is_available() -> bool {
-        cfg!(target_feature = "power9-vector")
+        cfg!(all(feature = "vsx", target_feature = "power9-vector"))
     }
 }
 
@@ -458,18 +487,65 @@ unsafe fn load_lo64(ptr: *const u8) -> vector_unsigned_char {
     unsafe { transmute::<[u64; 2], vector_unsigned_char>([lo, 0u64]) }
 }
 
+/// Loads 16 bytes from `ptr`, which need not be aligned.
+///
+/// # Safety
+/// `ptr` must be valid for reading 16 bytes, and the features of `L` must be available.
+#[inline(always)]
+unsafe fn load_unaligned<L: VsxLevel, T: Bytes>(ptr: *const u8) -> T {
+    if L::VSX {
+        // SAFETY: the caller guarantees that `ptr` is valid for 16 bytes.
+        return T::from_bytes(unsafe { ptr.cast::<vector_unsigned_char>().read_unaligned() });
+    }
+    // AltiVec `lvx` ignores the low address bits, so load the aligned blocks holding the first
+    // and the last byte (the same block if `ptr` is aligned) and shift the bytes into place with
+    // the permutation `lvsl` builds from the misalignment. The second block may extend past the
+    // end of the allocation, but an aligned block never crosses a page.
+    // SAFETY: the caller guarantees that `ptr` is valid for 16 bytes, see above for the blocks.
+    unsafe {
+        let lo = vec_ld(0, ptr);
+        let hi = vec_ld(15, ptr);
+        T::from_bytes(vec_perm(lo, hi, lvsl(ptr)))
+    }
+}
+
+/// Stores 16 bytes to `ptr`, which need not be aligned.
+///
+/// # Safety
+/// `ptr` must be valid for writing 16 bytes, and the features of `L` must be available.
+#[inline(always)]
+unsafe fn store_unaligned<L: VsxLevel, T: Bytes>(v: T, ptr: *mut u8) {
+    let ptr = ptr.cast::<vector_unsigned_char>();
+    // SAFETY: the caller guarantees that `ptr` is valid for 16 bytes.
+    unsafe {
+        if !L::VSX && ptr.is_aligned() {
+            ptr.write(v.to_bytes());
+        } else {
+            // On AltiVec an unaligned store must not touch the bytes around the slice, so this
+            // goes through the stack and general purpose registers.
+            ptr.write_unaligned(v.to_bytes());
+        }
+    }
+}
+
 // Instructions that stdarch does not expose (yet).
 //
-// These wrappers must not enable target features: LLVM's PowerPC backend only inlines a callee
-// whose target features are exactly those of the caller, so a wrapper enabling the POWER8
-// features would stay an out-of-line call in the POWER9 code built by `Power9::call`. VSX and
-// the POWER8 vector extensions are part of the compilation target of this module anyway.
+// These wrappers must not enable target features that are part of the compilation target: LLVM's
+// PowerPC backend only inlines a callee whose target features are exactly those of the caller,
+// so a wrapper enabling the POWER8 features would stay an out-of-line call. When the features
+// are not part of the target, the wrapper is only reachable through a level that is never
+// available, and `#[target_feature]` merely keeps the (dead) instructions assembling.
 
 macro_rules! asm_binop {
     ($name:ident, $insn:literal, $class:ident, $in:ty, $out:ty) => {
         /// # Safety
         /// VSX and the POWER8 vector extensions must be available.
-        #[inline(always)]
+        #[cfg_attr(target_feature = "power8-vector", inline(always))]
+        #[cfg_attr(
+            not(target_feature = "power8-vector"),
+            target_feature(enable = "vsx,power8-altivec,power8-vector"),
+            inline
+        )]
         unsafe fn $name(a: $in, b: $in) -> $out {
             let r: $out;
             // SAFETY: the caller guarantees the target features; the instruction only reads and
@@ -553,7 +629,8 @@ asm_binop!(
 
 /// # Safety
 /// VSX must be available.
-#[inline(always)]
+#[cfg_attr(target_feature = "vsx", inline(always))]
+#[cfg_attr(not(target_feature = "vsx"), target_feature(enable = "vsx"), inline)]
 unsafe fn xvsqrtsp(a: vector_float) -> vector_float {
     let r: vector_float;
     // SAFETY: the caller guarantees VSX; the instruction only reads and writes registers.
@@ -566,6 +643,190 @@ unsafe fn xvsqrtsp(a: vector_float) -> vector_float {
         );
     }
     r
+}
+
+// AltiVec instructions that stdarch does not expose; AltiVec is part of the compilation target.
+
+macro_rules! asm_altivec {
+    ($($name:ident($($arg:ident),*): $insn:literal;)*) => {$(
+        #[inline(always)]
+        unsafe fn $name($($arg: vector_float),*) -> vector_float {
+            let r: vector_float;
+            // SAFETY: the instruction only reads and writes registers.
+            unsafe {
+                asm!(
+                    concat!($insn, " {r}", $(", {", stringify!($arg), "}"),*),
+                    r = lateout(vreg) r,
+                    $($arg = in(vreg) $arg,)*
+                    options(pure, nomem, nostack),
+                );
+            }
+            r
+        }
+    )*};
+}
+
+asm_altivec! {
+    vmaxfp(a, b): "vmaxfp";
+    vminfp(a, b): "vminfp";
+    vrefp(a): "vrefp";
+    vrsqrtefp(a): "vrsqrtefp";
+}
+
+#[inline(always)]
+unsafe fn vcmpgtfp(a: vector_float, b: vector_float) -> vector_unsigned_int {
+    let r: vector_unsigned_int;
+    // SAFETY: the instruction only reads and writes registers.
+    unsafe {
+        asm!(
+            "vcmpgtfp {r}, {a}, {b}",
+            r = lateout(vreg) r,
+            a = in(vreg) a,
+            b = in(vreg) b,
+            options(pure, nomem, nostack),
+        );
+    }
+    r
+}
+
+/// The permutation that moves the 16 bytes starting at `ptr` to the front of the concatenation
+/// of the two aligned blocks around them (big-endian).
+#[inline(always)]
+unsafe fn lvsl(ptr: *const u8) -> vector_unsigned_char {
+    let r: vector_unsigned_char;
+    // SAFETY: the instruction only computes a permutation from the address, it does not access
+    // memory.
+    unsafe {
+        asm!(
+            "lvsl {r}, 0, {addr}",
+            r = lateout(vreg) r,
+            addr = in(reg) ptr as usize,
+            options(pure, nomem, nostack),
+        );
+    }
+    r
+}
+
+/// Division without VSX: the `vrefp` estimate of `1 / b` (12 bits) refined twice with
+/// Newton-Raphson, then one correction of the quotient with its residual. Dividing by zero
+/// yields NaN rather than infinity.
+///
+/// # Safety
+/// AltiVec must be available.
+#[inline(always)]
+unsafe fn vmx_div(a: vector_float, b: vector_float) -> vector_float {
+    // SAFETY: the caller guarantees AltiVec.
+    unsafe {
+        let one = vec_splats(1.0f32);
+        let r = vrefp(b);
+        let r = vec_madd(vec_nmsub(b, r, one), r, r);
+        let r = vec_madd(vec_nmsub(b, r, one), r, r);
+        let q = vec_mul(a, r);
+        vec_madd(vec_nmsub(b, q, a), r, q)
+    }
+}
+
+/// Square root without VSX: the `vrsqrtefp` estimate refined once with Newton-Raphson,
+/// multiplied by `x` and corrected once with its residual. Zero and infinity are passed
+/// through, as the estimate is infinite or zero there.
+///
+/// # Safety
+/// AltiVec must be available.
+#[inline(always)]
+unsafe fn vmx_sqrt(x: vector_float) -> vector_float {
+    // SAFETY: the caller guarantees AltiVec.
+    unsafe {
+        let half = vec_splats(0.5f32);
+        let y = vrsqrtefp(x);
+        let y = vec_mul(
+            y,
+            vec_nmsub(vec_mul(vec_mul(half, x), y), y, vec_splats(1.5f32)),
+        );
+        let s = vec_mul(x, y);
+        let s = vec_madd(vec_nmsub(s, s, x), vec_mul(half, y), s);
+        let bits: vector_unsigned_int = cast(x);
+        let zero: vector_unsigned_int = cast(vec_cmpeq(
+            vec_and(bits, vec_splats(0x7FFF_FFFFu32)),
+            vec_splats(0u32),
+        ));
+        let inf: vector_unsigned_int = cast(vec_cmpeq(bits, vec_splats(0x7F80_0000u32)));
+        vec_sel(s, x, vec_or(zero, inf))
+    }
+}
+
+/// Indices moving the low 32-bit word of each 64-bit lane of `a` into the high word of the
+/// result and zeroing the low word (`b` is zero), or the other way around if `to_low`.
+const fn move_word_idx(to_low: bool) -> [u8; 16] {
+    let low = if BIG_ENDIAN { 1 } else { 0 };
+    let (from, to) = if to_low {
+        (1 - low, low)
+    } else {
+        (low, 1 - low)
+    };
+    let mut elems = [4u8; 16];
+    let mut lane = 0;
+    while lane < 2 {
+        elems[2 * lane + to] = (2 * lane + from) as u8;
+        lane += 1;
+    }
+    elems_to_bytes(4, elems)
+}
+
+/// 64-bit lane addition without POWER8: 32-bit additions, with the carry out of each low word
+/// added to its high word.
+///
+/// # Safety
+/// AltiVec must be available.
+#[inline(always)]
+unsafe fn vmx_add_u64(a: vector_unsigned_long, b: vector_unsigned_long) -> vector_unsigned_long {
+    // SAFETY: the caller guarantees AltiVec.
+    unsafe {
+        let (a, b): (vector_unsigned_int, vector_unsigned_int) = (cast(a), cast(b));
+        let carry = shuffle(
+            vec_addc(a, b),
+            vec_splats(0u32),
+            const { move_word_idx(false) },
+        );
+        cast(vec_add(vec_add(a, b), carry))
+    }
+}
+
+/// 64-bit lane shifts without POWER8: 32-bit shifts, with the bits crossing from the low word
+/// to the high word (left) or the other way around (right) moved separately.
+///
+/// # Safety
+/// AltiVec must be available.
+#[inline(always)]
+unsafe fn vmx_shift_u64<const AMOUNT: u32, const LEFT: bool>(
+    v: vector_unsigned_long,
+) -> vector_unsigned_long {
+    // SAFETY: the caller guarantees AltiVec.
+    unsafe {
+        let v: vector_unsigned_int = cast(v);
+        let zero = vec_splats(0u32);
+        // Bits moved into the other word go from the low word to the high one when shifting
+        // left, and the other way around when shifting right.
+        let crossed = const { move_word_idx(!LEFT) };
+        let res = if AMOUNT == 0 {
+            v
+        } else if AMOUNT < 32 {
+            let n = vec_splats(AMOUNT);
+            let m = vec_splats(32 - AMOUNT);
+            let (same, cross) = if LEFT {
+                (vec_sl(v, n), vec_sr(v, m))
+            } else {
+                (vec_sr(v, n), vec_sl(v, m))
+            };
+            vec_or(same, shuffle(cross, zero, crossed))
+        } else if AMOUNT < 64 {
+            let n = vec_splats(AMOUNT - 32);
+            let same = if LEFT { vec_sl(v, n) } else { vec_sr(v, n) };
+            shuffle(same, zero, crossed)
+        } else {
+            zero
+        };
+        cast(res)
+    }
 }
 
 // The POWER9 wrappers are only called when `L::POWER9`, i.e. when POWER9 is part of the
@@ -693,22 +954,15 @@ impl<L: VsxLevel> F32SimdVec for F32VecVsx<L> {
     #[inline(always)]
     fn load(d: Self::Descriptor, mem: &[f32]) -> Self {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the load is unaligned.
-        Self(
-            unsafe { mem.as_ptr().cast::<vector_float>().read_unaligned() },
-            d,
-        )
+        // SAFETY: we just checked that `mem` has enough space.
+        Self(unsafe { load_unaligned::<L, _>(mem.as_ptr().cast()) }, d)
     }
 
     #[inline(always)]
     fn store(&self, mem: &mut [f32]) {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the store is unaligned.
-        unsafe {
-            mem.as_mut_ptr()
-                .cast::<vector_float>()
-                .write_unaligned(self.0)
-        }
+        // SAFETY: we just checked that `mem` has enough space.
+        unsafe { store_unaligned::<L, _>(self.0, mem.as_mut_ptr().cast()) }
     }
 
     #[inline(always)]
@@ -920,26 +1174,54 @@ impl<L: VsxLevel> F32SimdVec for F32VecVsx<L> {
 
     #[inline(always)]
     fn sqrt(self) -> Self {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        Self(unsafe { xvsqrtsp(self.0) }, self.1)
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                xvsqrtsp(self.0)
+            } else {
+                vmx_sqrt(self.0)
+            }
+        };
+        Self(r, self.1)
     }
 
     #[inline(always)]
     fn max(self, other: Self) -> Self {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        Self(unsafe { xvmaxsp(self.0, other.0) }, self.1)
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                xvmaxsp(self.0, other.0)
+            } else {
+                vmaxfp(self.0, other.0)
+            }
+        };
+        Self(r, self.1)
     }
 
     #[inline(always)]
     fn min(self, other: Self) -> Self {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        Self(unsafe { xvminsp(self.0, other.0) }, self.1)
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                xvminsp(self.0, other.0)
+            } else {
+                vminfp(self.0, other.0)
+            }
+        };
+        Self(r, self.1)
     }
 
     #[inline(always)]
     fn gt(self, other: Self) -> MaskVsx<L> {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        MaskVsx(cast(unsafe { xvcmpgtsp(self.0, other.0) }), self.1)
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                xvcmpgtsp(self.0, other.0)
+            } else {
+                vcmpgtfp(self.0, other.0)
+            }
+        };
+        MaskVsx(cast(r), self.1)
     }
 
     #[inline(always)]
@@ -984,17 +1266,10 @@ impl<L: VsxLevel> F32SimdVec for F32VecVsx<L> {
     #[inline(always)]
     fn prepare_table_bf16_8(_d: VsxDescriptor<L>, table: &[f32; 8]) -> Bf16Table8Vsx {
         // SAFETY: `table` has 8 elements, so both loads are in bounds.
-        let (lo, hi) = unsafe {
+        let (lo, hi): (vector_unsigned_char, vector_unsigned_char) = unsafe {
             (
-                table
-                    .as_ptr()
-                    .cast::<vector_unsigned_char>()
-                    .read_unaligned(),
-                table
-                    .as_ptr()
-                    .add(4)
-                    .cast::<vector_unsigned_char>()
-                    .read_unaligned(),
+                load_unaligned::<L, _>(table.as_ptr().cast()),
+                load_unaligned::<L, _>(table.as_ptr().add(4).cast()),
             )
         };
         // BF16 is the high 16 bits of f32.
@@ -1061,8 +1336,15 @@ impl<L: VsxLevel> Div<F32VecVsx<L>> for F32VecVsx<L> {
     type Output = Self;
     #[inline(always)]
     fn div(self, rhs: F32VecVsx<L>) -> F32VecVsx<L> {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        F32VecVsx(unsafe { xvdivsp(self.0, rhs.0) }, self.1)
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                xvdivsp(self.0, rhs.0)
+            } else {
+                vmx_div(self.0, rhs.0)
+            }
+        };
+        F32VecVsx(r, self.1)
     }
 }
 
@@ -1112,11 +1394,8 @@ impl<L: VsxLevel> I32SimdVec for I32VecVsx<L> {
     #[inline(always)]
     fn load(d: Self::Descriptor, mem: &[i32]) -> Self {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the load is unaligned.
-        Self(
-            unsafe { mem.as_ptr().cast::<vector_signed_int>().read_unaligned() },
-            d,
-        )
+        // SAFETY: we just checked that `mem` has enough space.
+        Self(unsafe { load_unaligned::<L, _>(mem.as_ptr().cast()) }, d)
     }
 
     #[inline(always)]
@@ -1149,12 +1428,8 @@ impl<L: VsxLevel> I32SimdVec for I32VecVsx<L> {
     #[inline(always)]
     fn store(&self, mem: &mut [i32]) {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the store is unaligned.
-        unsafe {
-            mem.as_mut_ptr()
-                .cast::<vector_signed_int>()
-                .write_unaligned(self.0)
-        }
+        // SAFETY: we just checked that `mem` has enough space.
+        unsafe { store_unaligned::<L, _>(self.0, mem.as_mut_ptr().cast()) }
     }
 
     #[inline(always)]
@@ -1220,6 +1495,23 @@ impl<L: VsxLevel> I32SimdVec for I32VecVsx<L> {
 
     #[inline(always)]
     fn mul_wide_take_high(self, rhs: Self) -> Self {
+        if !L::VSX {
+            // AltiVec has no 32-bit widening multiply; this is only used by the squeeze
+            // transform, so do it per lane.
+            // SAFETY: vectors are plain bags of bits of the same size as the arrays.
+            let (a, b) = unsafe {
+                (
+                    transmute::<vector_signed_int, [i32; 4]>(self.0),
+                    transmute::<vector_signed_int, [i32; 4]>(rhs.0),
+                )
+            };
+            let r = std::array::from_fn(|i| ((a[i] as i64 * b[i] as i64) >> 32) as i32);
+            // SAFETY: as above.
+            return Self(
+                unsafe { transmute::<[i32; 4], vector_signed_int>(r) },
+                self.1,
+            );
+        }
         // SAFETY: VSX is available by the safety invariant on the descriptor.
         Self(unsafe { mul_high_i32(self.0, rhs.0) }, self.1)
     }
@@ -1314,22 +1606,15 @@ impl<L: VsxLevel> I16SimdVec for I16VecVsx<L> {
     #[inline(always)]
     fn load(d: Self::Descriptor, mem: &[i16]) -> Self {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the load is unaligned.
-        Self(
-            unsafe { mem.as_ptr().cast::<vector_signed_short>().read_unaligned() },
-            d,
-        )
+        // SAFETY: we just checked that `mem` has enough space.
+        Self(unsafe { load_unaligned::<L, _>(mem.as_ptr().cast()) }, d)
     }
 
     #[inline(always)]
     fn store(&self, mem: &mut [i16]) {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the store is unaligned.
-        unsafe {
-            mem.as_mut_ptr()
-                .cast::<vector_signed_short>()
-                .write_unaligned(self.0)
-        }
+        // SAFETY: we just checked that `mem` has enough space.
+        unsafe { store_unaligned::<L, _>(self.0, mem.as_mut_ptr().cast()) }
     }
 
     #[inline(always)]
@@ -1555,40 +1840,41 @@ impl<L: VsxLevel> U64SimdVec for U64VecVsx<L> {
     #[inline(always)]
     fn load(d: Self::Descriptor, mem: &[u64]) -> Self {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the load is unaligned.
-        Self(
-            unsafe { mem.as_ptr().cast::<vector_unsigned_long>().read_unaligned() },
-            d,
-        )
+        // SAFETY: we just checked that `mem` has enough space.
+        Self(unsafe { load_unaligned::<L, _>(mem.as_ptr().cast()) }, d)
     }
 
     #[inline(always)]
     fn store(&self, mem: &mut [u64]) {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the store is unaligned.
-        unsafe {
-            mem.as_mut_ptr()
-                .cast::<vector_unsigned_long>()
-                .write_unaligned(self.0)
-        }
+        // SAFETY: we just checked that `mem` has enough space.
+        unsafe { store_unaligned::<L, _>(self.0, mem.as_mut_ptr().cast()) }
     }
 
     #[inline(always)]
     fn shl<const AMOUNT_U: u32, const AMOUNT_I: i32>(self) -> Self {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        Self(
-            unsafe { vsld(self.0, Self::shift_amount::<AMOUNT_U>()) },
-            self.1,
-        )
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                vsld(self.0, Self::shift_amount::<AMOUNT_U>())
+            } else {
+                vmx_shift_u64::<AMOUNT_U, true>(self.0)
+            }
+        };
+        Self(r, self.1)
     }
 
     #[inline(always)]
     fn shr<const AMOUNT_U: u32, const AMOUNT_I: i32>(self) -> Self {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        Self(
-            unsafe { vsrd(self.0, Self::shift_amount::<AMOUNT_U>()) },
-            self.1,
-        )
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                vsrd(self.0, Self::shift_amount::<AMOUNT_U>())
+            } else {
+                vmx_shift_u64::<AMOUNT_U, false>(self.0)
+            }
+        };
+        Self(r, self.1)
     }
 
     #[inline(always)]
@@ -1609,8 +1895,15 @@ impl<L: VsxLevel> Add<U64VecVsx<L>> for U64VecVsx<L> {
     type Output = U64VecVsx<L>;
     #[inline(always)]
     fn add(self, rhs: U64VecVsx<L>) -> U64VecVsx<L> {
-        // SAFETY: VSX is available by the safety invariant on the descriptor.
-        U64VecVsx(unsafe { vaddudm(self.0, rhs.0) }, self.1)
+        // SAFETY: the features of `L` are available by the safety invariant on the descriptor.
+        let r = unsafe {
+            if L::VSX {
+                vaddudm(self.0, rhs.0)
+            } else {
+                vmx_add_u64(self.0, rhs.0)
+            }
+        };
+        U64VecVsx(r, self.1)
     }
 }
 
@@ -1655,11 +1948,8 @@ impl<L: VsxLevel> U8SimdVec for U8VecVsx<L> {
     #[inline(always)]
     fn load(d: Self::Descriptor, mem: &[u8]) -> Self {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the load is unaligned.
-        Self(
-            unsafe { mem.as_ptr().cast::<vector_unsigned_char>().read_unaligned() },
-            d,
-        )
+        // SAFETY: we just checked that `mem` has enough space.
+        Self(unsafe { load_unaligned::<L, _>(mem.as_ptr()) }, d)
     }
 
     #[inline(always)]
@@ -1671,12 +1961,8 @@ impl<L: VsxLevel> U8SimdVec for U8VecVsx<L> {
     #[inline(always)]
     fn store(&self, mem: &mut [u8]) {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the store is unaligned.
-        unsafe {
-            mem.as_mut_ptr()
-                .cast::<vector_unsigned_char>()
-                .write_unaligned(self.0)
-        }
+        // SAFETY: we just checked that `mem` has enough space.
+        unsafe { store_unaligned::<L, _>(self.0, mem.as_mut_ptr()) }
     }
 
     #[inline(always)]
@@ -1718,15 +2004,8 @@ impl<L: VsxLevel> U16SimdVec for U16VecVsx<L> {
     #[inline(always)]
     fn load(d: Self::Descriptor, mem: &[u16]) -> Self {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the load is unaligned.
-        Self(
-            unsafe {
-                mem.as_ptr()
-                    .cast::<vector_unsigned_short>()
-                    .read_unaligned()
-            },
-            d,
-        )
+        // SAFETY: we just checked that `mem` has enough space.
+        Self(unsafe { load_unaligned::<L, _>(mem.as_ptr().cast()) }, d)
     }
 
     #[inline(always)]
@@ -1738,12 +2017,8 @@ impl<L: VsxLevel> U16SimdVec for U16VecVsx<L> {
     #[inline(always)]
     fn store(&self, mem: &mut [u16]) {
         assert!(mem.len() >= Self::LEN);
-        // SAFETY: we just checked that `mem` has enough space, and the store is unaligned.
-        unsafe {
-            mem.as_mut_ptr()
-                .cast::<vector_unsigned_short>()
-                .write_unaligned(self.0)
-        }
+        // SAFETY: we just checked that `mem` has enough space.
+        unsafe { store_unaligned::<L, _>(self.0, mem.as_mut_ptr().cast()) }
     }
 
     #[inline(always)]

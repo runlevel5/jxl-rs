@@ -4,15 +4,16 @@
 // license that can be found in the LICENSE file.
 
 #![allow(clippy::too_many_arguments)]
-// The PowerPC intrinsics are not stable yet, so the `vsx` feature requires a nightly compiler.
+// The PowerPC intrinsics are not stable yet, so the `vmx` feature requires a nightly compiler.
 #![cfg_attr(
-    all(feature = "vsx", target_arch = "powerpc64"),
+    all(feature = "vmx", target_arch = "powerpc64"),
     feature(stdarch_powerpc)
 )]
-// `#[target_feature]` is only used when POWER9 is not part of the compilation target.
+// `#[target_feature]` is only used for the instructions of ISA levels that are not part of the
+// compilation target.
 #![cfg_attr(
     all(
-        feature = "vsx",
+        feature = "vmx",
         target_arch = "powerpc64",
         not(target_feature = "power9-vector")
     ),
@@ -43,13 +44,8 @@ pub mod scalar;
 #[cfg(all(target_arch = "aarch64", feature = "neon"))]
 pub use aarch64::neon::NeonDescriptor;
 pub use float16::f16;
-#[cfg(all(
-    target_arch = "powerpc64",
-    feature = "vsx",
-    target_feature = "vsx",
-    target_feature = "power8-vector"
-))]
-pub use powerpc64::vsx::{Power8, Power9, VsxDescriptor, VsxLevel};
+#[cfg(all(target_arch = "powerpc64", feature = "vmx", target_feature = "altivec"))]
+pub use powerpc64::vsx::{Power8, Power9, Vmx, VsxDescriptor, VsxLevel};
 pub use scalar::ScalarDescriptor;
 #[cfg(all(target_arch = "wasm32", feature = "simd128"))]
 pub use wasm32::simd128::Simd128Descriptor;

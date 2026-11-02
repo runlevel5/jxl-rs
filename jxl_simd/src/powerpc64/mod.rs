@@ -6,16 +6,12 @@
 #![allow(unsafe_code)]
 #![allow(clippy::identity_op)]
 
-// The backend requires VSX and the POWER8 vector extensions at compile time: they are the
-// powerpc64le baseline, and on big-endian they can be enabled with e.g. `-C target-cpu=pwr8`.
-// LLVM does not inline the AltiVec intrinsics into functions that enable features through
-// `#[target_feature]`, so detecting a level at runtime would leave every vector operation as a
-// function call. POWER9 is likewise a compile-time choice (`-C target-cpu=pwr9`), see `vsx.rs`.
-#[cfg(all(
-    feature = "vsx",
-    target_feature = "vsx",
-    target_feature = "power8-vector"
-))]
+// The backend requires AltiVec at compile time, which every powerpc64 target enables. The ISA
+// level is a compile-time choice as well (`-C target-cpu=pwr8`, `pwr9`, ...; powerpc64le
+// implies POWER8): LLVM does not inline the AltiVec intrinsics into functions that enable
+// features through `#[target_feature]`, so detecting a level at runtime would leave every
+// vector operation as a function call, see `vsx.rs`.
+#[cfg(all(feature = "vmx", target_feature = "altivec"))]
 pub(super) mod vsx;
 
 #[macro_export]
@@ -39,11 +35,7 @@ macro_rules! simd_function {
     };
 }
 
-#[cfg(all(
-    feature = "vsx",
-    target_feature = "vsx",
-    target_feature = "power8-vector"
-))]
+#[cfg(all(feature = "vmx", target_feature = "altivec"))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! simd_function_body_vsx {
@@ -57,14 +49,13 @@ macro_rules! simd_function_body_vsx {
         if let Some(d) = $crate::VsxDescriptor::<$crate::Power8>::new() {
             return $name(d, $($val),*);
         }
+        if let Some(d) = $crate::VsxDescriptor::<$crate::Vmx>::new() {
+            return $name(d, $($val),*);
+        }
     };
 }
 
-#[cfg(not(all(
-    feature = "vsx",
-    target_feature = "vsx",
-    target_feature = "power8-vector"
-)))]
+#[cfg(not(all(feature = "vmx", target_feature = "altivec")))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! simd_function_body_vsx {
@@ -88,16 +79,19 @@ macro_rules! test_all_instruction_sets {
     };
 }
 
-#[cfg(all(
-    feature = "vsx",
-    target_feature = "vsx",
-    target_feature = "power8-vector"
-))]
+#[cfg(all(feature = "vmx", target_feature = "altivec"))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! test_vsx {
     ($name:ident) => {
         paste::paste! {
+            #[test]
+            fn [<$name _vmx>]() {
+                use $crate::SimdDescriptor;
+                let Some(d) = $crate::VsxDescriptor::<$crate::Vmx>::new() else { return; };
+                d.call($name)
+            }
+
             #[test]
             fn [<$name _power8>]() {
                 use $crate::SimdDescriptor;
@@ -116,11 +110,7 @@ macro_rules! test_vsx {
     };
 }
 
-#[cfg(not(all(
-    feature = "vsx",
-    target_feature = "vsx",
-    target_feature = "power8-vector"
-)))]
+#[cfg(not(all(feature = "vmx", target_feature = "altivec")))]
 #[doc(hidden)]
 #[macro_export]
 macro_rules! test_vsx {

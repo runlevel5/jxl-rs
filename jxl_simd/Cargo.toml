@@ -18,13 +18,15 @@ arbtest = "0.3.2"
 paste = "1.0.15"
 
 [features]
-all-simd = ["sse42", "avx", "avx512", "neon", "simd128", "vsx"]
+all-simd = ["sse42", "avx", "avx512", "neon", "simd128", "vmx", "vsx"]
 sse42 = []
 avx = ["sse42"]
 avx512 = ["avx"]
 neon = []
 simd128 = []
-vsx = []
+# PowerPC: `vmx` is the AltiVec backend, `vsx` adds the POWER8 and POWER9 levels.
+vmx = []
+vsx = ["vmx"]
 
 [lints]
 workspace = true
